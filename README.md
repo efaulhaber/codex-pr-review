@@ -72,6 +72,24 @@ By default, the script refuses to review diffs larger than 300000 bytes. Overrid
 CODEX_REVIEW_MAX_DIFF_BYTES=600000 ./codex-pr-review.sh 123
 ```
 
+## Custom Review Instructions
+
+Repository-specific review instructions can be stored next to `codex-pr-review.sh`.
+The script looks for a Markdown file named after the GitHub repository slug:
+
+```text
+<script-dir>/<owner>/<repo>.md
+```
+
+For example, reviews for `efaulhaber/codex-pr-review` load:
+
+```text
+efaulhaber/codex-pr-review.md
+```
+
+When a matching file exists, its contents are included in the Codex review prompt.
+The terminal output reports whether custom instructions were loaded or no matching file was found.
+
 ## What Gets Posted
 
 The posted review includes:

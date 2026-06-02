@@ -7,6 +7,7 @@ if [[ $# -ne 1 ]]; then
 fi
 
 PR="$1"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 command -v gh >/dev/null || { echo "gh is required" >&2; exit 1; }
 command -v git >/dev/null || { echo "git is required" >&2; exit 1; }
@@ -36,6 +37,16 @@ fi
 echo
 echo "Repository: ${OWNER}/${REPO}" >&2
 echo "PR: #${PR}" >&2
+
+CUSTOM_INSTRUCTIONS_FILE="${SCRIPT_DIR}/${OWNER}/${REPO}.md"
+CUSTOM_INSTRUCTIONS=""
+
+if [[ -f "$CUSTOM_INSTRUCTIONS_FILE" ]]; then
+  CUSTOM_INSTRUCTIONS="$(<"$CUSTOM_INSTRUCTIONS_FILE")"
+  echo "Custom review instructions: loaded ${CUSTOM_INSTRUCTIONS_FILE}" >&2
+else
+  echo "Custom review instructions: none found at ${CUSTOM_INSTRUCTIONS_FILE}" >&2
+fi
 
 BASE_REF="$(gh pr view "$PR" --json baseRefName -q .baseRefName)"
 HEAD_SHA="$(gh pr view "$PR" --json headRefOid -q .headRefOid)"
@@ -131,6 +142,8 @@ Hard requirements:
 - Use severity "ERROR" for likely bugs/security/data-loss issues, "WARNING" for important risks, "INFO" for remaining issues.
 - Paths must match the diff paths exactly, without leading "a/" or "b/".
 - Line numbers must be new-file line numbers visible in the PR diff.
+
+${CUSTOM_INSTRUCTIONS}
 
 JSON shape:
 {
