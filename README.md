@@ -105,12 +105,18 @@ Diagnostics use these severities:
 
 The posted review is created with GitHub's `COMMENT` event, so it does not approve the pull request or request changes.
 
-## Notes
+## Security
 
 - Pull request titles, bodies, and diffs are treated as untrusted input in the review prompt
   to reduce the risk of prompt injections.
+- Codex runs with `--ephemeral --sandbox read-only` against a temporary detached worktree.
 - The temporary worktree and intermediate files are removed when the script exits.
-- Codex runs with `--ephemeral --sandbox read-only` against the temporary worktree.
+- GitHub API requests use the local `gh` authentication token through `GITHUB_TOKEN`.
+
+## Notes
+
+- For forked repositories, it might be necessary to first run `gh repo set-default`
+  to set the repository context for GitHub CLI.
 
 ## License
 
