@@ -111,3 +111,7 @@ The posted review is created with GitHub's `COMMENT` event, so it does not appro
   to reduce the risk of prompt injections.
 - The temporary worktree and intermediate files are removed when the script exits.
 - Codex runs with `--ephemeral --sandbox read-only` against the temporary worktree.
+
+## License
+
+MIT License. See [LICENSE](LICENSE).

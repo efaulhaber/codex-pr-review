@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026 Erik Faulhaber
+# SPDX-License-Identifier: MIT
 set -euo pipefail
 
 if [[ $# -ne 1 ]]; then
