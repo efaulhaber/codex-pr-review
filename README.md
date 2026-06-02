@@ -63,7 +63,7 @@ review 123
 Run without posting anything:
 
 ```bash
-DRY_RUN=1 ./codex-pr-review.sh 123
+DRY_RUN=1 review 123
 ```
 
 By default, the script refuses to review diffs larger than 300000 bytes. Override that limit with `CODEX_REVIEW_MAX_DIFF_BYTES`:
