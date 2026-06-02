@@ -74,17 +74,17 @@ CODEX_REVIEW_MAX_DIFF_BYTES=600000 ./codex-pr-review.sh 123
 
 ## Custom Review Instructions
 
-Repository-specific review instructions can be stored next to `codex-pr-review.sh`.
+Repository-specific review instructions can be stored next to `codex-pr-review.sh` in the `custom-instructions` directory.
 The script looks for a Markdown file named after the GitHub repository slug:
 
 ```text
-<script-dir>/<owner>/<repo>.md
+<script-dir>/custom-instructions/<owner>/<repo>.md
 ```
 
 For example, reviews for `efaulhaber/codex-pr-review` load:
 
 ```text
-efaulhaber/codex-pr-review.md
+<script-dir>/custom-instructions/efaulhaber/codex-pr-review.md
 ```
 
 When a matching file exists, its contents are included in the Codex review prompt.

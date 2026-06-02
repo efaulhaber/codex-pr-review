@@ -38,7 +38,7 @@ echo
 echo "Repository: ${OWNER}/${REPO}" >&2
 echo "PR: #${PR}" >&2
 
-CUSTOM_INSTRUCTIONS_FILE="${SCRIPT_DIR}/${OWNER}/${REPO}.md"
+CUSTOM_INSTRUCTIONS_FILE="${SCRIPT_DIR}/custom-instructions/${OWNER}/${REPO}.md"
 CUSTOM_INSTRUCTIONS=""
 
 if [[ -f "$CUSTOM_INSTRUCTIONS_FILE" ]]; then
