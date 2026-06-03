@@ -3,7 +3,7 @@
 `codex-pr-review.sh` runs Codex against a GitHub pull request diff and posts the result as a GitHub pull request review.
 It uses Codex CLI to work with included quota of a ChatGPT subscription instead of OpenAI API billing, and it uses GitHub CLI to post reviews.
 
-The script checks out the pull request head in a temporary detached worktree, builds a zero-context unified diff against the pull request base branch, asks Codex for structured JSON findings, validates that JSON with `jq`, and posts any diagnostics as inline review comments.
+The script checks out the pull request head in a temporary detached worktree, runs several focused Codex passes against the pull request base branch, asks Codex to merge the findings of the individual passes, and posts any diagnostics as inline review comments.
 
 ## Requirements
 
@@ -16,6 +16,7 @@ The script checks out the pull request head in a temporary detached worktree, bu
 - Codex CLI authentication through saved ChatGPT/Codex auth
 
 The script unsets `OPENAI_API_KEY` and `CODEX_API_KEY` before invoking Codex so that the Codex CLI uses saved account authentication instead of OpenAI API billing.
+For review execution, it creates a temporary `CODEX_HOME` and copies only top-level Codex auth files into it, so personal Codex or VS Code extension instructions are not loaded.
 
 ## Setup
 
@@ -66,12 +67,6 @@ Run without posting anything:
 DRY_RUN=1 review 123
 ```
 
-By default, the script refuses to review diffs larger than 300000 bytes. Override that limit with `CODEX_REVIEW_MAX_DIFF_BYTES`:
-
-```bash
-CODEX_REVIEW_MAX_DIFF_BYTES=600000 ./codex-pr-review.sh 123
-```
-
 ## Custom Review Instructions
 
 Repository-specific review instructions can be stored next to `codex-pr-review.sh` in the `custom-instructions` directory.
@@ -87,8 +82,21 @@ For example, reviews for `efaulhaber/codex-pr-review` load:
 <script-dir>/custom-instructions/efaulhaber/codex-pr-review.md
 ```
 
-When a matching file exists, its contents are included in the Codex review prompt.
+When a matching file exists, its contents are included in each Codex review pass and in the final synthesis prompt.
 The terminal output reports whether custom instructions were loaded or no matching file was found.
+
+## Review Pass Prompts
+
+The focused pass prompts live next to `codex-pr-review.sh` in `review-prompts`:
+
+```text
+<script-dir>/review-prompts/01-correctness.md
+<script-dir>/review-prompts/02-tests.md
+<script-dir>/review-prompts/03-maintainability.md
+<script-dir>/review-prompts/04-docs.md
+```
+
+Edit these files to tune the individual review passes without changing the shell script.
 
 ## What Gets Posted
 
@@ -109,7 +117,8 @@ The posted review is created with GitHub's `COMMENT` event, so it does not appro
 
 - Pull request titles, bodies, and diffs are treated as untrusted input in the review prompt
   to reduce the risk of prompt injections.
-- Codex runs with `--ephemeral --sandbox read-only` against a temporary detached worktree.
+- Codex passes run with `--ephemeral --ignore-user-config --ignore-rules --sandbox read-only` against a temporary detached worktree and temporary auth-only `CODEX_HOME`.
+- The final synthesis pass uses the same isolation flags.
 - The temporary worktree and intermediate files are removed when the script exits.
 - GitHub API requests use the local `gh` authentication token through `GITHUB_TOKEN`.
 
