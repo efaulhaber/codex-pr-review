@@ -90,20 +90,20 @@ The terminal output reports whether custom instructions were loaded or no matchi
 The posted review includes:
 
 - A top-level `Codex Review` body with a factual Markdown summary of the pull request changes.
+- An AI-generated review notice and a small `codex-pr-review` attribution link.
 - Inline comments for diagnostics that Codex ties to changed lines in the pull request diff.
 
 Diagnostics use these severities:
 
-- `ERROR` for likely bugs, security issues, or data-loss issues.
-- `WARNING` for important risks.
-- `INFO` for remaining issues.
+- `HIGH` for likely bugs, security issues, or data-loss issues.
+- `MEDIUM` for important risks.
+- `LOW` for remaining issues.
 
 The posted review is created with GitHub's `COMMENT` event, so it does not approve the pull request or request changes.
 
 ## Security
 
-- Pull request titles, bodies, and diffs are treated as untrusted input in the review prompt
-  to reduce the risk of prompt injections.
+- The script runs Codex with isolated settings to ignore local custom instructions.
 - Codex passes run with `--ephemeral --ignore-user-config --ignore-rules --sandbox read-only` against a temporary detached worktree and temporary auth-only `CODEX_HOME`.
 - The final synthesis pass uses the same isolation flags.
 - The temporary worktree and intermediate files are removed when the script exits.
