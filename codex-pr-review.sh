@@ -3,6 +3,10 @@
 # SPDX-License-Identifier: MIT
 set -euo pipefail
 
+# Input and Dependencies
+
+# Parse input and verify local tool dependencies before doing any network or
+# worktree operations.
 if [[ $# -ne 1 ]]; then
   echo "Usage: $0 <pr-number>" >&2
   exit 2
@@ -31,6 +35,10 @@ CODEX_REVIEW_ARGS=(
   --ignore-rules
 )
 
+# Repository and PR Metadata
+
+# Resolve repository identity and PR metadata from the caller's current git
+# repository. All later git operations run from the repository root.
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
 
@@ -67,6 +75,10 @@ TITLE="$(gh pr view "$PR" --json title -q .title)"
 echo "Base: ${BASE_REF}" >&2
 echo "Head SHA: ${HEAD_SHA}" >&2
 
+# Temporary Workspace
+
+# Keep all generated prompts, logs, outputs, and the detached review worktree in
+# a single temporary directory so cleanup can be centralized.
 TMPDIR="$(mktemp -d)"
 WORKTREE="$TMPDIR/worktree"
 REAL_CODEX_HOME="${CODEX_HOME:-${HOME}/.codex}"
@@ -97,6 +109,9 @@ mkdir -p \
   "$PASS_OUTPUT_DIR" \
   "$PASS_STATUS_DIR"
 
+# Run Codex from an isolated CODEX_HOME containing only auth. This keeps the
+# review independent of the user's local config while still using saved login
+# credentials.
 copied_codex_auth=0
 for auth_file in auth.json auth.toml; do
   if [[ -f "$REAL_CODEX_HOME/$auth_file" ]]; then
@@ -113,12 +128,16 @@ fi
 
 export CODEX_HOME="$ISOLATED_CODEX_HOME"
 
+# Worktree Preparation
+
+# Fetch the base branch and check out the PR head SHA in a detached worktree.
+# The exact head SHA comes from GitHub, so no local PR ref is needed.
 git fetch origin "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}" --quiet
-git fetch origin "+refs/pull/${PR}/head:refs/remotes/origin/pr/${PR}" --quiet
 git worktree add --detach "$WORKTREE" "$HEAD_SHA" >/dev/null 2>&1
 
 BASE_SHA="$(git -C "$WORKTREE" merge-base "origin/${BASE_REF}" HEAD)"
 
+# Print a compact diff size summary before launching the review passes.
 git -C "$WORKTREE" diff --no-ext-diff --numstat "$BASE_SHA"...HEAD |
   awk '
     {
@@ -137,6 +156,10 @@ git -C "$WORKTREE" diff --no-ext-diff --numstat "$BASE_SHA"...HEAD |
     }
   ' >&2
 
+# Review Pass Helpers
+
+# Write one prompt per review pass. Custom repository instructions are appended
+# to every prompt so each pass applies the same project-specific expectations.
 write_pass_prompt() {
   local prompt_file="$1"
   local pass_number="$2"
@@ -174,6 +197,7 @@ PROMPT
   fi
 }
 
+# Execute one Codex review pass inside the detached PR worktree.
 run_codex_review() {
   local label="$1"
   local prompt_file="$2"
@@ -193,6 +217,7 @@ run_codex_review() {
   )
 }
 
+# Render a small in-place status table while the four review passes run in parallel.
 render_pass_statuses() {
   local frame="$1"
   local status
@@ -226,6 +251,8 @@ render_pass_statuses() {
   PASS_STATUS_RENDERED=1
 }
 
+# Wait for all review passes, collect their stderr logs, and fail the whole
+# review if any pass failed.
 wait_for_review_passes() {
   local remaining=4
   local frame=0
@@ -282,6 +309,8 @@ wait_for_review_passes() {
   fi
 }
 
+# Start one review pass in the background and record its PID, output log, and
+# status file so wait_for_review_passes can monitor it.
 start_review_pass() {
   local index="$1"
   local label="$2"
@@ -304,6 +333,10 @@ start_review_pass() {
   PASS_PIDS+=("$!")
 }
 
+# Review Passes
+
+# Define the four independent review prompts. The final synthesis pass later
+# deduplicates findings across these category-specific reports.
 write_pass_prompt \
   "$PASS_PROMPT_DIR/01-correctness.md" \
   1 \
@@ -374,6 +407,11 @@ start_review_pass \
 
 wait_for_review_passes
 
+# Final Synthesis
+
+# Ask Codex to merge the four Markdown reports into the GitHub code scanning
+# diagnostic shape. Keeping this as JSON makes validation and payload rendering
+# deterministic.
 {
   cat <<PROMPT
 Merge the four Codex review pass reports for PR #${PR} in ${OWNER}/${REPO}.
@@ -469,6 +507,10 @@ echo "Running Codex review pass: Final synthesis" >&2
     2> >(tee -a "$CODEX_LOG_FILE" >&2)
 )
 
+# Validation and Review Body
+
+# Validate the minimum structure needed to render a GitHub review. jq will exit
+# non-zero here if Codex returns invalid JSON or omits required fields.
 jq -e '
   type == "object"
   and (keys | sort == ["body", "diagnostics"])
@@ -493,6 +535,8 @@ jq -e '
   fi
 } >&2
 
+# Build the top-level PR review body. Inline comments are created separately
+# from diagnostics below.
 {
   echo "## Codex Review"
   echo
@@ -510,6 +554,7 @@ medium_count="$(jq \
 low_count="$(jq '[.diagnostics[]? | select(.severity == "LOW")] | length' \
   "$JSON_FILE")"
 
+# Report the generated severity distribution before posting anything to GitHub.
 printf 'Codex produced %s high, %s medium, %s low findings.\n' \
   "$high_count" \
   "$medium_count" \
@@ -527,6 +572,11 @@ if [[ "${DRY_RUN:-0}" == "1" ]]; then
   exit 0
 fi
 
+# GitHub Review Payload
+
+# Convert diagnostics into GitHub review comments. GitHub gets human-facing
+# severity labels, while the JSON file keeps the structured HIGH/MEDIUM/LOW
+# values used for counting and validation.
 jq \
   --rawfile body "$REVIEW_BODY_FILE" \
   --arg commit_id "$HEAD_SHA" \
