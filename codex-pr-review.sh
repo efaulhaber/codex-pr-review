@@ -392,8 +392,8 @@ Hard requirements:
 - "body" must contain the summary of the PR changes, as returned by Pass 1, not the review findings.
 - "diagnostics" must be an array.
 - Each diagnostic must be actionable and tied to a changed line in the diff.
-- Use severity "ERROR" for likely bugs/security/data-loss issues, "WARNING"
-  for important risks, "INFO" for remaining issues.
+- Use severity "HIGH" for likely bugs/security/data-loss issues, "MEDIUM"
+  for important risks, "LOW" for remaining issues.
 - Paths must match the diff paths exactly, without leading "a/" or "b/".
 - Line numbers must be new-file line numbers visible in the PR diff.
 
@@ -409,7 +409,7 @@ JSON shape:
           "start": { "line": 123, "column": 1 }
         }
       },
-      "severity": "ERROR",
+      "severity": "HIGH",
       "code": {
         "value": "codex-review"
       },
@@ -504,18 +504,18 @@ jq -e '
   jq -r '.body' "$JSON_FILE"
 } > "$REVIEW_BODY_FILE"
 
-error_count="$(jq '[.diagnostics[]? | select(.severity == "ERROR")] | length' \
+high_count="$(jq '[.diagnostics[]? | select(.severity == "HIGH")] | length' \
   "$JSON_FILE")"
-warning_count="$(jq \
-  '[.diagnostics[]? | select((.severity // "WARNING") == "WARNING")] | length' \
+medium_count="$(jq \
+  '[.diagnostics[]? | select((.severity // "MEDIUM") == "MEDIUM")] | length' \
   "$JSON_FILE")"
-info_count="$(jq '[.diagnostics[]? | select(.severity == "INFO")] | length' \
+low_count="$(jq '[.diagnostics[]? | select(.severity == "LOW")] | length' \
   "$JSON_FILE")"
 
-printf 'Codex produced %s errors, %s warnings, %s infos.\n' \
-  "$error_count" \
-  "$warning_count" \
-  "$info_count" \
+printf 'Codex produced %s high, %s medium, %s low findings.\n' \
+  "$high_count" \
+  "$medium_count" \
+  "$low_count" \
   >&2
 
 {
@@ -541,7 +541,14 @@ jq \
         path: .location.path,
         line: .location.range.start.line,
         side: "RIGHT",
-        body: (((.severity // "WARNING") | ascii_downcase | ascii_upcase) + ": " + .message)
+        body: (
+          (
+            if .severity == "HIGH" then "**High:**"
+            elif .severity == "LOW" then "**Low:**"
+            else "**Medium:**"
+            end
+          ) + " " + .message
+        )
       }
     ]
   }' "$JSON_FILE" \
