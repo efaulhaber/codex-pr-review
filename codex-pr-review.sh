@@ -10,7 +10,6 @@ fi
 
 PR="$1"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-PASS_TEMPLATE_DIR="$SCRIPT_DIR/review-prompts"
 
 command -v gh >/dev/null || { echo "gh is required" >&2; exit 1; }
 command -v git >/dev/null || { echo "git is required" >&2; exit 1; }
@@ -61,20 +60,6 @@ else
   echo "Custom review instructions: none found at ${CUSTOM_INSTRUCTIONS_FILE}" >&2
 fi
 
-PASS_TEMPLATE_FILES=(
-  "$PASS_TEMPLATE_DIR/01-correctness.md"
-  "$PASS_TEMPLATE_DIR/02-tests.md"
-  "$PASS_TEMPLATE_DIR/03-maintainability.md"
-  "$PASS_TEMPLATE_DIR/04-docs.md"
-)
-
-for pass_template_file in "${PASS_TEMPLATE_FILES[@]}"; do
-  if [[ ! -f "$pass_template_file" ]]; then
-    echo "Review pass prompt not found: ${pass_template_file}" >&2
-    exit 1
-  fi
-done
-
 BASE_REF="$(gh pr view "$PR" --json baseRefName -q .baseRefName)"
 HEAD_SHA="$(gh pr view "$PR" --json headRefOid -q .headRefOid)"
 TITLE="$(gh pr view "$PR" --json title -q .title)"
@@ -99,6 +84,7 @@ CODEX_LOG_FILE="$TMPDIR/codex.log"
 PASS_PROMPT_DIR="$TMPDIR/pass-prompts"
 PASS_OUTPUT_DIR="$TMPDIR/pass-outputs"
 SYNTHESIS_PROMPT_FILE="$TMPDIR/synthesis-prompt.md"
+JSON_FILE="$TMPDIR/codex-review.json"
 REVIEW_BODY_FILE="$TMPDIR/review-body.md"
 REVIEW_PAYLOAD_FILE="$TMPDIR/review-payload.json"
 
@@ -148,29 +134,35 @@ write_pass_prompt() {
   local prompt_file="$1"
   local pass_number="$2"
   local pass_title="$3"
-  local pass_template_file="$4"
+  local pass_template
 
-  {
-    echo "Review this PR against origin/${BASE_REF}."
-    echo ""
-    echo "Use git diff origin/${BASE_REF}...HEAD."
-    echo ""
-    echo "This is pass ${pass_number} of 4: ${pass_title}."
-    echo "Only perform this pass. Do not cover other review categories except where they"
-    echo "directly affect this pass."
-    echo "Report concrete, actionable findings. If there are no findings for this pass,"
-    echo "say so clearly."
-    echo ""
-    cat "$pass_template_file"
-    echo ""
-    echo "Output Markdown. Lead with findings, ordered by severity. Include exact file"
-    echo "and line references when possible."
-    echo ""
-    if [[ -n "$CUSTOM_INSTRUCTIONS" ]]; then
-      echo "$CUSTOM_INSTRUCTIONS"
-      echo ""
-    fi
-  } > "$prompt_file"
+  pass_template="$(cat)"
+
+  cat > "$prompt_file" <<PROMPT
+Review this PR against origin/${BASE_REF}.
+
+Use git diff origin/${BASE_REF}...HEAD.
+
+This is pass ${pass_number} of 4: ${pass_title}.
+Only perform this pass. Do not cover other review categories except where they
+directly affect this pass.
+Report concrete, actionable findings. If there are no findings for this pass,
+say so clearly.
+
+${pass_template}
+
+Output Markdown. Order your findings by severity. Include exact file
+and line references.
+PROMPT
+
+  if [[ -n "$CUSTOM_INSTRUCTIONS" ]]; then
+    {
+      echo
+      cat <<PROMPT
+${CUSTOM_INSTRUCTIONS}
+PROMPT
+    } >> "$prompt_file"
+  fi
 }
 
 run_codex_review() {
@@ -195,26 +187,43 @@ run_codex_review() {
 write_pass_prompt \
   "$PASS_PROMPT_DIR/01-correctness.md" \
   1 \
-  "Correctness and regressions" \
-  "${PASS_TEMPLATE_FILES[0]}"
+  "Correctness and regressions" <<'PROMPT'
+Review changed production behavior for bugs, edge cases, invalid assumptions,
+error handling, compatibility, security, race conditions, data loss,
+performance, and appropriate data type handling.
+
+Add a summary section, which summarizes the *intended* PR changes, not the review findings.
+Keep the summary factual and concise with bullets.
+PROMPT
 
 write_pass_prompt \
   "$PASS_PROMPT_DIR/02-tests.md" \
   2 \
-  "Tests" \
-  "${PASS_TEMPLATE_FILES[1]}"
+  "Tests" <<'PROMPT'
+Review changed tests and missing tests. Assess whether the tests would actually
+catch regressions. Look for weak assertions, missing edge/negative cases,
+brittle tests, over-mocking, implementation-detail testing, and changed behavior
+without test coverage.
+PROMPT
 
 write_pass_prompt \
   "$PASS_PROMPT_DIR/03-maintainability.md" \
   3 \
-  "Maintainability and code quality" \
-  "${PASS_TEMPLATE_FILES[2]}"
+  "Maintainability and code quality" <<'PROMPT'
+Review readability, naming, complexity, duplication, abstractions, coupling,
+style, project conventions, and consistency with surrounding code.
+PROMPT
 
 write_pass_prompt \
   "$PASS_PROMPT_DIR/04-docs.md" \
   4 \
-  "Documentation, comments, and text quality" \
-  "${PASS_TEMPLATE_FILES[3]}"
+  "Documentation, comments, and text quality" <<'PROMPT'
+Review docs, comments, examples, names, error messages, logs, and
+user/developer-facing text as human-facing writing. Look for wording, clarity,
+coherence, formatting, structure, reader flow, completeness, terminology
+consistency, misleading implications, stale explanations, awkward phrasing, and
+general quality.
+PROMPT
 
 run_codex_review \
   "Pass 1: Correctness and regressions" \
@@ -234,38 +243,101 @@ run_codex_review \
   "$PASS_OUTPUT_DIR/04-docs.md"
 
 {
-  echo "Merge the four Codex review pass reports for PR #${PR} in ${OWNER}/${REPO}."
-  echo ""
-  echo "Use the pass reports below as the source material. Deduplicate overlapping"
-  echo "findings, resolve contradictions conservatively, and keep only findings that"
-  echo "are concrete and actionable."
-  echo "Order final findings by severity. Preserve useful file and line references."
-  echo "Do not invent new findings that are not supported by the pass reports."
-  echo "If all passes found no issues, say that clearly and mention any residual test"
-  echo "or review limitations reported by the passes."
-  echo ""
+  cat <<PROMPT
+Merge the four Codex review pass reports for PR #${PR} in ${OWNER}/${REPO}.
+
+Return ONLY valid JSON.
+
+Use the pass reports below as the source material. Deduplicate overlapping
+findings, resolve contradictions conservatively, and keep only findings that
+are concrete and actionable.
+Order final findings by severity. Preserve file and line references.
+Do not invent new findings that are not supported by the pass reports.
+
+Hard requirements:
+- Return a single JSON object.
+- Top-level keys must be "body" and "diagnostics".
+- "body" must contain the summary of the PR changes, as returned by Pass 1, not the review findings.
+- "diagnostics" must be an array.
+- Each diagnostic must be actionable and tied to a changed line in the diff.
+- Use severity "ERROR" for likely bugs/security/data-loss issues, "WARNING"
+  for important risks, "INFO" for remaining issues.
+- Paths must match the diff paths exactly, without leading "a/" or "b/".
+- Line numbers must be new-file line numbers visible in the PR diff.
+
+JSON shape:
+{
+  "body": "PR summary.",
+  "diagnostics": [
+    {
+      "message": "Explain the problem and a concrete fix.",
+      "location": {
+        "path": "path/from/repo/root.ext",
+        "range": {
+          "start": { "line": 123, "column": 1 }
+        }
+      },
+      "severity": "ERROR",
+      "code": {
+        "value": "codex-review"
+      },
+      "source": {
+        "name": "codex-pr-review"
+      }
+    }
+  ]
+}
+
+PROMPT
   if [[ -n "$CUSTOM_INSTRUCTIONS" ]]; then
-    echo "$CUSTOM_INSTRUCTIONS"
-    echo ""
+    cat <<PROMPT
+${CUSTOM_INSTRUCTIONS}
+
+PROMPT
   fi
-  echo "## Pass 1: Correctness and regressions"
-  echo
+
+  cat <<'PROMPT'
+## Pass 1: Correctness and regressions
+
+PROMPT
   cat "$PASS_OUTPUT_DIR/01-correctness.md"
-  echo
-  echo "## Pass 2: Tests"
-  echo
+
+  cat <<'PROMPT'
+
+## Pass 2: Tests
+
+PROMPT
   cat "$PASS_OUTPUT_DIR/02-tests.md"
-  echo
-  echo "## Pass 3: Maintainability and code quality"
-  echo
+
+  cat <<'PROMPT'
+
+## Pass 3: Maintainability and code quality
+
+PROMPT
   cat "$PASS_OUTPUT_DIR/03-maintainability.md"
-  echo
-  echo "## Pass 4: Documentation, comments, and text quality"
-  echo
+
+  cat <<'PROMPT'
+
+## Pass 4: Documentation, comments, and text quality
+
+PROMPT
   cat "$PASS_OUTPUT_DIR/04-docs.md"
 } > "$SYNTHESIS_PROMPT_FILE"
 
-run_codex_review "Final synthesis" "$SYNTHESIS_PROMPT_FILE" "$REVIEW_BODY_FILE"
+# run_codex_review "Final synthesis" "$SYNTHESIS_PROMPT_FILE" "$JSON_FILE"
+
+jq -e '
+  type == "object"
+  and (keys | sort == ["body", "diagnostics"])
+  and (.body | type == "string")
+  and (.body | length > 0)
+  and (.diagnostics | type == "array")
+  and all(.diagnostics[]?;
+    (.message | type == "string") and
+    (.location.path | type == "string") and
+    (.location.range.start.line | type == "number")
+  )
+' "$JSON_FILE" >/dev/null
 
 {
   echo
@@ -286,9 +358,22 @@ run_codex_review "Final synthesis" "$SYNTHESIS_PROMPT_FILE" "$REVIEW_BODY_FILE"
     "before acting on them._"
   echo
   echo
-  cat "$REVIEW_BODY_FILE"
-} > "${REVIEW_BODY_FILE}.tmp"
-mv "${REVIEW_BODY_FILE}.tmp" "$REVIEW_BODY_FILE"
+  jq -r '.body' "$JSON_FILE"
+} > "$REVIEW_BODY_FILE"
+
+error_count="$(jq '[.diagnostics[]? | select(.severity == "ERROR")] | length' \
+  "$JSON_FILE")"
+warning_count="$(jq \
+  '[.diagnostics[]? | select((.severity // "WARNING") == "WARNING")] | length' \
+  "$JSON_FILE")"
+info_count="$(jq '[.diagnostics[]? | select(.severity == "INFO")] | length' \
+  "$JSON_FILE")"
+
+printf 'Codex produced %s errors, %s warnings, %s infos.\n' \
+  "$error_count" \
+  "$warning_count" \
+  "$info_count" \
+  >&2
 
 {
   echo
@@ -307,9 +392,16 @@ jq \
   '{
     commit_id: $commit_id,
     event: "COMMENT",
-    body: $body
-  }' \
-  --null-input \
+    body: $body,
+    comments: [
+      .diagnostics[] | {
+        path: .location.path,
+        line: .location.range.start.line,
+        side: "RIGHT",
+        body: (((.severity // "WARNING") | ascii_downcase | ascii_upcase) + ": " + .message)
+      }
+    ]
+  }' "$JSON_FILE" \
   > "$REVIEW_PAYLOAD_FILE"
 
 env GITHUB_TOKEN="$TOKEN" \

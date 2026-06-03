@@ -85,19 +85,6 @@ For example, reviews for `efaulhaber/codex-pr-review` load:
 When a matching file exists, its contents are included in each Codex review pass and in the final synthesis prompt.
 The terminal output reports whether custom instructions were loaded or no matching file was found.
 
-## Review Pass Prompts
-
-The focused pass prompts live next to `codex-pr-review.sh` in `review-prompts`:
-
-```text
-<script-dir>/review-prompts/01-correctness.md
-<script-dir>/review-prompts/02-tests.md
-<script-dir>/review-prompts/03-maintainability.md
-<script-dir>/review-prompts/04-docs.md
-```
-
-Edit these files to tune the individual review passes without changing the shell script.
-
 ## What Gets Posted
 
 The posted review includes:
