@@ -81,14 +81,21 @@ cleanup() {
 trap cleanup EXIT
 
 CODEX_LOG_FILE="$TMPDIR/codex.log"
+PASS_LOG_DIR="$TMPDIR/pass-logs"
 PASS_PROMPT_DIR="$TMPDIR/pass-prompts"
 PASS_OUTPUT_DIR="$TMPDIR/pass-outputs"
+PASS_STATUS_DIR="$TMPDIR/pass-statuses"
 SYNTHESIS_PROMPT_FILE="$TMPDIR/synthesis-prompt.md"
 JSON_FILE="$TMPDIR/codex-review.json"
 REVIEW_BODY_FILE="$TMPDIR/review-body.md"
 REVIEW_PAYLOAD_FILE="$TMPDIR/review-payload.json"
 
-mkdir -p "$ISOLATED_CODEX_HOME" "$PASS_PROMPT_DIR" "$PASS_OUTPUT_DIR"
+mkdir -p \
+  "$ISOLATED_CODEX_HOME" \
+  "$PASS_LOG_DIR" \
+  "$PASS_PROMPT_DIR" \
+  "$PASS_OUTPUT_DIR" \
+  "$PASS_STATUS_DIR"
 
 copied_codex_auth=0
 for auth_file in auth.json auth.toml; do
@@ -171,8 +178,8 @@ run_codex_review() {
   local label="$1"
   local prompt_file="$2"
   local output_file="$3"
+  local stderr_file="$4"
 
-  echo "Running Codex review pass: ${label}" >&2
   (
     cd "$WORKTREE"
     codex "${CODEX_ARGS[@]}" exec review \
@@ -182,8 +189,119 @@ run_codex_review() {
       - \
       < "$prompt_file" \
       > "$output_file" \
-      2> >(tee -a "$CODEX_LOG_FILE" >&2)
+      2> "$stderr_file"
   )
+}
+
+render_pass_statuses() {
+  local frame="$1"
+  local status
+  local status_file
+  local label
+  local rc
+  local dots
+
+  if [[ "${PASS_STATUS_RENDERED:-0}" -eq 1 ]]; then
+    printf '\033[4A' >&2
+  fi
+
+  for i in 0 1 2 3; do
+    label="${PASS_LABELS[$i]}"
+    status_file="${PASS_STATUS_FILES[$i]}"
+    if [[ -f "$status_file" ]]; then
+      rc="$(<"$status_file")"
+      if [[ "$rc" -eq 0 ]]; then
+        status="completed"
+      else
+        status="failed (${rc})"
+      fi
+    else
+      printf -v dots '%*s' "$(((frame % 3) + 1))" ''
+      status="running ${dots// /.}"
+    fi
+
+    printf '\033[2K%s: %s\n' "$label" "$status" >&2
+  done
+
+  PASS_STATUS_RENDERED=1
+}
+
+wait_for_review_passes() {
+  local remaining=4
+  local frame=0
+  local status_file
+  local rc
+  local failed=0
+
+  render_pass_statuses "$frame"
+  while [[ "$remaining" -gt 0 ]]; do
+    sleep 1
+    remaining=0
+    for status_file in "${PASS_STATUS_FILES[@]}"; do
+      if [[ ! -f "$status_file" ]]; then
+        remaining=$((remaining + 1))
+      fi
+    done
+    frame=$((frame + 1))
+    render_pass_statuses "$frame"
+  done
+
+  for i in 0 1 2 3; do
+    wait "${PASS_PIDS[$i]}" || true
+  done
+
+  for i in 0 1 2 3; do
+    {
+      echo "## ${PASS_LABELS[$i]}"
+      echo
+      if [[ -s "${PASS_LOG_FILES[$i]}" ]]; then
+        cat "${PASS_LOG_FILES[$i]}"
+      else
+        echo "(empty)"
+      fi
+      echo
+    } >> "$CODEX_LOG_FILE"
+  done
+
+  for status_file in "${PASS_STATUS_FILES[@]}"; do
+    rc="$(<"$status_file")"
+    if [[ "$rc" -ne 0 ]]; then
+      failed=1
+    fi
+  done
+
+  if [[ "$failed" -ne 0 ]]; then
+    {
+      echo
+      echo "## Codex Log"
+      echo
+      cat "$CODEX_LOG_FILE"
+      echo "One or more Codex review passes failed."
+    } >&2
+    return 1
+  fi
+}
+
+start_review_pass() {
+  local index="$1"
+  local label="$2"
+  local prompt_file="$3"
+  local output_file="$4"
+  local log_file="$PASS_LOG_DIR/${index}.log"
+  local status_file="$PASS_STATUS_DIR/${index}.status"
+
+  PASS_LABELS+=("$label")
+  PASS_LOG_FILES+=("$log_file")
+  PASS_STATUS_FILES+=("$status_file")
+
+  (
+    if run_codex_review "$label" "$prompt_file" "$output_file" "$log_file"; then
+      echo 0 > "$status_file"
+    else
+      echo "$?" > "$status_file"
+    fi
+  ) &
+  PASS_PIDS+=("$!")
 }
 
 write_pass_prompt \
@@ -227,22 +345,34 @@ consistency, misleading implications, stale explanations, awkward phrasing, and
 general quality.
 PROMPT
 
-run_codex_review \
+PASS_LABELS=()
+PASS_LOG_FILES=()
+PASS_PIDS=()
+PASS_STATUS_FILES=()
+PASS_STATUS_RENDERED=0
+
+start_review_pass \
+  "01-correctness" \
   "Pass 1: Correctness and regressions" \
   "$PASS_PROMPT_DIR/01-correctness.md" \
   "$PASS_OUTPUT_DIR/01-correctness.md"
-run_codex_review \
+start_review_pass \
+  "02-tests" \
   "Pass 2: Tests" \
   "$PASS_PROMPT_DIR/02-tests.md" \
   "$PASS_OUTPUT_DIR/02-tests.md"
-run_codex_review \
+start_review_pass \
+  "03-maintainability" \
   "Pass 3: Maintainability and code quality" \
   "$PASS_PROMPT_DIR/03-maintainability.md" \
   "$PASS_OUTPUT_DIR/03-maintainability.md"
-run_codex_review \
+start_review_pass \
+  "04-docs" \
   "Pass 4: Documentation, comments, and text quality" \
   "$PASS_PROMPT_DIR/04-docs.md" \
   "$PASS_OUTPUT_DIR/04-docs.md"
+
+wait_for_review_passes
 
 {
   cat <<PROMPT
@@ -326,7 +456,18 @@ PROMPT
   cat "$PASS_OUTPUT_DIR/04-docs.md"
 } > "$SYNTHESIS_PROMPT_FILE"
 
-run_codex_review "Final synthesis" "$SYNTHESIS_PROMPT_FILE" "$JSON_FILE"
+echo "Running Codex review pass: Final synthesis" >&2
+(
+  cd "$WORKTREE"
+  codex "${CODEX_ARGS[@]}" exec review \
+    "${CODEX_REVIEW_ARGS[@]}" \
+    -c "model_reasoning_effort=\"${CODEX_REVIEW_REASONING_EFFORT:-medium}\"" \
+    --title "${TITLE} (Final synthesis)" \
+    - \
+    < "$SYNTHESIS_PROMPT_FILE" \
+    > "$JSON_FILE" \
+    2> >(tee -a "$CODEX_LOG_FILE" >&2)
+)
 
 jq -e '
   type == "object"
