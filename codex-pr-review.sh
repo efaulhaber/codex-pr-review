@@ -148,6 +148,8 @@ Only perform this pass. Do not cover other review categories except where they
 directly affect this pass.
 Report concrete, actionable findings. If there are no findings for this pass,
 say so clearly.
+Do not stop at the first finding. Review the entire diff and report all findings
+in this pass.
 
 ${pass_template}
 
@@ -193,7 +195,7 @@ error handling, compatibility, security, race conditions, data loss,
 performance, and appropriate data type handling.
 
 Add a summary section, which summarizes the *intended* PR changes, not the review findings.
-Keep the summary factual and concise with bullets.
+Keep the summary factual and concise with bullets and do not mention any of your findings.
 PROMPT
 
 write_pass_prompt \
@@ -324,7 +326,7 @@ PROMPT
   cat "$PASS_OUTPUT_DIR/04-docs.md"
 } > "$SYNTHESIS_PROMPT_FILE"
 
-# run_codex_review "Final synthesis" "$SYNTHESIS_PROMPT_FILE" "$JSON_FILE"
+run_codex_review "Final synthesis" "$SYNTHESIS_PROMPT_FILE" "$JSON_FILE"
 
 jq -e '
   type == "object"
