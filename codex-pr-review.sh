@@ -130,10 +130,20 @@ export CODEX_HOME="$ISOLATED_CODEX_HOME"
 
 # Worktree Preparation
 
-# Fetch the base branch and check out the PR head SHA in a detached worktree.
-# The exact head SHA comes from GitHub, so no local PR ref is needed.
+# Fetch the base branch and GitHub's synthetic PR head ref, then check out the
+# exact PR head SHA in a detached worktree. Fetching refs/pull/<PR>/head makes
+# fork PR commits available locally without adding the fork as a remote.
 git fetch origin "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}" --quiet
-git worktree add --detach "$WORKTREE" "$HEAD_SHA" >/dev/null 2>&1
+git fetch origin "+refs/pull/${PR}/head" --quiet
+
+FETCHED_HEAD_SHA="$(git rev-parse "FETCH_HEAD^{commit}")"
+if [[ "$FETCHED_HEAD_SHA" != "$HEAD_SHA" ]]; then
+  echo "Fetched PR head ${FETCHED_HEAD_SHA}, but GitHub reported ${HEAD_SHA}." >&2
+  echo "The pull request may have changed while the review was starting; retry." >&2
+  exit 1
+fi
+
+git worktree add --detach "$WORKTREE" "$FETCHED_HEAD_SHA"
 
 BASE_SHA="$(git -C "$WORKTREE" merge-base "origin/${BASE_REF}" HEAD)"
 
