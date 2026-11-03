@@ -18,7 +18,28 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 command -v gh >/dev/null || { echo "gh is required" >&2; exit 1; }
 command -v git >/dev/null || { echo "git is required" >&2; exit 1; }
 command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
-command -v codex >/dev/null || { echo "codex is required" >&2; exit 1; }
+
+# Select the review agent with REVIEW_AGENT=claude (default) or REVIEW_AGENT=codex.
+REVIEW_AGENT="${REVIEW_AGENT:-claude}"
+REVIEW_EFFORT="${REVIEW_EFFORT:-${CODEX_REVIEW_REASONING_EFFORT:-medium}}"
+
+case "$REVIEW_AGENT" in
+  codex)
+    AGENT_NAME="Codex"
+    ;;
+  claude)
+    AGENT_NAME="Claude"
+    ;;
+  *)
+    echo "Unknown REVIEW_AGENT '${REVIEW_AGENT}'. Use 'claude' or 'codex'." >&2
+    exit 2
+    ;;
+esac
+
+command -v "$REVIEW_AGENT" >/dev/null || {
+  echo "$REVIEW_AGENT is required" >&2
+  exit 1
+}
 
 # Make sure Codex CLI uses your saved ChatGPT/Codex auth,
 # not OpenAI API billing.
@@ -34,6 +55,86 @@ CODEX_REVIEW_ARGS=(
   --ignore-user-config
   --ignore-rules
 )
+
+# Make sure Claude Code uses your saved Claude subscription login,
+# not Anthropic API billing.
+unset ANTHROPIC_API_KEY
+
+# Run Claude Code non-interactively without user customizations (CLAUDE.md,
+# skills, hooks, plugins, MCP servers) and without saving the session. Only
+# read-only tools and read-only git commands are allowed; every other tool call
+# is denied automatically.
+CLAUDE_ARGS=(
+  --print
+  --safe-mode
+  --strict-mcp-config
+  --no-session-persistence
+  --permission-mode dontAsk
+  --tools "Read,Grep,Glob,Bash"
+  --allowedTools
+  "Read"
+  "Grep"
+  "Glob"
+  "Bash(git diff *)"
+  "Bash(git log *)"
+  "Bash(git show *)"
+  "Bash(git blame *)"
+  "Bash(git grep *)"
+  "Bash(git ls-files *)"
+  "Bash(git merge-base *)"
+  "Bash(git rev-parse *)"
+  "Bash(git status *)"
+  --effort "$REVIEW_EFFORT"
+)
+
+if [[ -n "${CLAUDE_REVIEW_MODEL:-}" ]]; then
+  CLAUDE_ARGS+=(--model "$CLAUDE_REVIEW_MODEL")
+fi
+
+# JSON Schema for the Claude synthesis pass. Claude validates its final answer
+# against this schema, so no Markdown fences or prose end up in the JSON file.
+CLAUDE_SYNTHESIS_SCHEMA='{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["body", "diagnostics"],
+  "properties": {
+    "body": { "type": "string", "minLength": 1 },
+    "diagnostics": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["message", "location", "severity"],
+        "properties": {
+          "message": { "type": "string" },
+          "location": {
+            "type": "object",
+            "required": ["path", "range"],
+            "properties": {
+              "path": { "type": "string" },
+              "range": {
+                "type": "object",
+                "required": ["start"],
+                "properties": {
+                  "start": {
+                    "type": "object",
+                    "required": ["line"],
+                    "properties": {
+                      "line": { "type": "integer" },
+                      "column": { "type": "integer" }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "severity": { "enum": ["HIGH", "MEDIUM", "LOW"] },
+          "code": { "type": "object" },
+          "source": { "type": "object" }
+        }
+      }
+    }
+  }
+}'
 
 # Repository and PR Metadata
 
@@ -92,13 +193,13 @@ cleanup() {
 }
 trap cleanup EXIT
 
-CODEX_LOG_FILE="$TMPDIR/codex.log"
+AGENT_LOG_FILE="$TMPDIR/agent.log"
 PASS_LOG_DIR="$TMPDIR/pass-logs"
 PASS_PROMPT_DIR="$TMPDIR/pass-prompts"
 PASS_OUTPUT_DIR="$TMPDIR/pass-outputs"
 PASS_STATUS_DIR="$TMPDIR/pass-statuses"
 SYNTHESIS_PROMPT_FILE="$TMPDIR/synthesis-prompt.md"
-JSON_FILE="$TMPDIR/codex-review.json"
+JSON_FILE="$TMPDIR/review.json"
 REVIEW_BODY_FILE="$TMPDIR/review-body.md"
 REVIEW_PAYLOAD_FILE="$TMPDIR/review-payload.json"
 
@@ -111,22 +212,24 @@ mkdir -p \
 
 # Run Codex from an isolated CODEX_HOME containing only auth. This keeps the
 # review independent of the user's local config while still using saved login
-# credentials.
-copied_codex_auth=0
-for auth_file in auth.json auth.toml; do
-  if [[ -f "$REAL_CODEX_HOME/$auth_file" ]]; then
-    cp "$REAL_CODEX_HOME/$auth_file" "$ISOLATED_CODEX_HOME/$auth_file"
-    copied_codex_auth=1
+# credentials. Claude Code is isolated through CLAUDE_ARGS instead.
+if [[ "$REVIEW_AGENT" == "codex" ]]; then
+  copied_codex_auth=0
+  for auth_file in auth.json auth.toml; do
+    if [[ -f "$REAL_CODEX_HOME/$auth_file" ]]; then
+      cp "$REAL_CODEX_HOME/$auth_file" "$ISOLATED_CODEX_HOME/$auth_file"
+      copied_codex_auth=1
+    fi
+  done
+
+  if [[ "$copied_codex_auth" -eq 0 ]]; then
+    echo "No Codex auth file found in ${REAL_CODEX_HOME}." >&2
+    echo "Run codex login or set CODEX_HOME to a directory containing Codex auth." >&2
+    exit 1
   fi
-done
 
-if [[ "$copied_codex_auth" -eq 0 ]]; then
-  echo "No Codex auth file found in ${REAL_CODEX_HOME}." >&2
-  echo "Run codex login or set CODEX_HOME to a directory containing Codex auth." >&2
-  exit 1
+  export CODEX_HOME="$ISOLATED_CODEX_HOME"
 fi
-
-export CODEX_HOME="$ISOLATED_CODEX_HOME"
 
 # Worktree Preparation
 
@@ -207,20 +310,30 @@ PROMPT
   fi
 }
 
-# Execute one Codex review pass inside the detached PR worktree.
-run_codex_review() {
+# Execute one review pass inside the detached PR worktree with the selected
+# agent. Any additional arguments are passed on to the agent CLI.
+run_agent_review() {
   local label="$1"
   local prompt_file="$2"
   local output_file="$3"
   local stderr_file="$4"
+  shift 4
 
   (
     cd "$WORKTREE"
-    codex "${CODEX_ARGS[@]}" exec review \
-      "${CODEX_REVIEW_ARGS[@]}" \
-      -c "model_reasoning_effort=\"${CODEX_REVIEW_REASONING_EFFORT:-medium}\"" \
-      --title "${TITLE} (${label})" \
-      - \
+    case "$REVIEW_AGENT" in
+      codex)
+        codex "${CODEX_ARGS[@]}" exec review \
+          "${CODEX_REVIEW_ARGS[@]}" \
+          -c "model_reasoning_effort=\"${REVIEW_EFFORT}\"" \
+          --title "${TITLE} (${label})" \
+          "$@" \
+          -
+        ;;
+      claude)
+        claude "${CLAUDE_ARGS[@]}" "$@"
+        ;;
+    esac \
       < "$prompt_file" \
       > "$output_file" \
       2> "$stderr_file"
@@ -297,7 +410,7 @@ wait_for_review_passes() {
         echo "(empty)"
       fi
       echo
-    } >> "$CODEX_LOG_FILE"
+    } >> "$AGENT_LOG_FILE"
   done
 
   for status_file in "${PASS_STATUS_FILES[@]}"; do
@@ -310,10 +423,10 @@ wait_for_review_passes() {
   if [[ "$failed" -ne 0 ]]; then
     {
       echo
-      echo "## Codex Log"
+      echo "## ${AGENT_NAME} Log"
       echo
-      cat "$CODEX_LOG_FILE"
-      echo "One or more Codex review passes failed."
+      cat "$AGENT_LOG_FILE"
+      echo "One or more ${AGENT_NAME} review passes failed."
     } >&2
     return 1
   fi
@@ -334,7 +447,7 @@ start_review_pass() {
   PASS_STATUS_FILES+=("$status_file")
 
   (
-    if run_codex_review "$label" "$prompt_file" "$output_file" "$log_file"; then
+    if run_agent_review "$label" "$prompt_file" "$output_file" "$log_file"; then
       echo 0 > "$status_file"
     else
       echo "$?" > "$status_file"
@@ -419,12 +532,12 @@ wait_for_review_passes
 
 # Final Synthesis
 
-# Ask Codex to merge the four Markdown reports into the GitHub code scanning
+# Ask the agent to merge the four Markdown reports into the GitHub code scanning
 # diagnostic shape. Keeping this as JSON makes validation and payload rendering
 # deterministic.
 {
   cat <<PROMPT
-Merge the four Codex review pass reports for PR #${PR} in ${OWNER}/${REPO}.
+Merge the four review pass reports for PR #${PR} in ${OWNER}/${REPO}.
 
 Return ONLY valid JSON.
 
@@ -504,23 +617,38 @@ PROMPT
   cat "$PASS_OUTPUT_DIR/04-docs.md"
 } > "$SYNTHESIS_PROMPT_FILE"
 
-echo "Running Codex review pass: Final synthesis" >&2
-(
-  cd "$WORKTREE"
-  codex "${CODEX_ARGS[@]}" exec review \
-    "${CODEX_REVIEW_ARGS[@]}" \
-    -c "model_reasoning_effort=\"${CODEX_REVIEW_REASONING_EFFORT:-medium}\"" \
-    --title "${TITLE} (Final synthesis)" \
-    - \
-    < "$SYNTHESIS_PROMPT_FILE" \
-    > "$JSON_FILE" \
-    2> >(tee -a "$CODEX_LOG_FILE" >&2)
-)
+echo "Running ${AGENT_NAME} review pass: Final synthesis" >&2
+case "$REVIEW_AGENT" in
+  codex)
+    run_agent_review \
+      "Final synthesis" \
+      "$SYNTHESIS_PROMPT_FILE" \
+      "$JSON_FILE" \
+      >(tee -a "$AGENT_LOG_FILE" >&2)
+    ;;
+  claude)
+    # Claude wraps the schema-validated answer in a JSON result envelope.
+    run_agent_review \
+      "Final synthesis" \
+      "$SYNTHESIS_PROMPT_FILE" \
+      "$TMPDIR/claude-synthesis-result.json" \
+      >(tee -a "$AGENT_LOG_FILE" >&2) \
+      --output-format json \
+      --json-schema "$CLAUDE_SYNTHESIS_SCHEMA"
+    jq -e '.structured_output // empty' \
+      "$TMPDIR/claude-synthesis-result.json" \
+      > "$JSON_FILE" || {
+      echo "Claude returned no structured synthesis output:" >&2
+      cat "$TMPDIR/claude-synthesis-result.json" >&2
+      exit 1
+    }
+    ;;
+esac
 
 # Validation and Review Body
 
 # Validate the minimum structure needed to render a GitHub review. jq will exit
-# non-zero here if Codex returns invalid JSON or omits required fields.
+# non-zero here if the agent returns invalid JSON or omits required fields.
 jq -e '
   type == "object"
   and (keys | sort == ["body", "diagnostics"])
@@ -536,10 +664,10 @@ jq -e '
 
 {
   echo
-  echo "## Codex Log"
+  echo "## ${AGENT_NAME} Log"
   echo
-  if [[ -s "$CODEX_LOG_FILE" ]]; then
-    echo "Full Codex log was printed above."
+  if [[ -s "$AGENT_LOG_FILE" ]]; then
+    echo "Full ${AGENT_NAME} log was printed above."
   else
     echo "(empty)"
   fi
@@ -548,7 +676,7 @@ jq -e '
 # Build the top-level PR review body. Inline comments are created separately
 # from diagnostics below.
 {
-  echo "## Codex Review"
+  echo "## ${AGENT_NAME} Review"
   echo
   jq -r '.body' "$JSON_FILE"
   echo
@@ -565,7 +693,8 @@ low_count="$(jq '[.diagnostics[]? | select(.severity == "LOW")] | length' \
   "$JSON_FILE")"
 
 # Report the generated severity distribution before posting anything to GitHub.
-printf 'Codex produced %s high, %s medium, %s low findings.\n' \
+printf '%s produced %s high, %s medium, %s low findings.\n' \
+  "$AGENT_NAME" \
   "$high_count" \
   "$medium_count" \
   "$low_count" \
