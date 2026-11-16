@@ -705,7 +705,37 @@ printf '%s produced %s high, %s medium, %s low findings.\n' \
   cat "$REVIEW_BODY_FILE"
 } >&2
 
+# Print all findings ordered by severity, with their location and an indented
+# message, so the full review can be read in the terminal.
+print_findings() {
+  {
+    echo
+    echo "## ${AGENT_NAME} Findings"
+    echo
+    jq -r '
+      def rank:
+        if .severity == "HIGH" then 0
+        elif .severity == "LOW" then 2
+        else 1
+        end;
+
+      if (.diagnostics | length) == 0 then
+        "No findings."
+      else
+        .diagnostics
+        | sort_by(rank)
+        | to_entries[]
+        | "\(.key + 1). [\(.value.severity // "MEDIUM")] "
+          + "\(.value.location.path):\(.value.location.range.start.line)\n"
+          + (.value.message | split("\n") | map("   " + .) | join("\n"))
+          + "\n"
+      end
+    ' "$JSON_FILE"
+  } >&2
+}
+
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
+  print_findings
   echo
   echo "DRY_RUN=1, not posting GitHub review." >&2
   exit 0
