@@ -21,7 +21,7 @@ command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
 
 # Select the review agent with REVIEW_AGENT=claude (default) or REVIEW_AGENT=codex.
 REVIEW_AGENT="${REVIEW_AGENT:-claude}"
-REVIEW_EFFORT="${REVIEW_EFFORT:-${CODEX_REVIEW_REASONING_EFFORT:-medium}}"
+REVIEW_EFFORT="${REVIEW_EFFORT:-${CODEX_REVIEW_REASONING_EFFORT:-high}}"
 
 case "$REVIEW_AGENT" in
   codex)
@@ -36,8 +36,16 @@ case "$REVIEW_AGENT" in
     ;;
 esac
 
-command -v "$REVIEW_AGENT" >/dev/null || {
-  echo "$REVIEW_AGENT is required" >&2
+# Select a specific Claude Code binary with CLAUDE_BIN, e.g., to compare versions.
+CLAUDE_BIN="${CLAUDE_BIN:-claude}"
+if [[ "$REVIEW_AGENT" == "claude" ]]; then
+  AGENT_BIN="$CLAUDE_BIN"
+else
+  AGENT_BIN="$REVIEW_AGENT"
+fi
+
+command -v "$AGENT_BIN" >/dev/null || {
+  echo "$AGENT_BIN is required" >&2
   exit 1
 }
 
@@ -70,6 +78,7 @@ CLAUDE_ARGS=(
   --strict-mcp-config
   --no-session-persistence
   --permission-mode dontAsk
+  --output-format json
   --tools "Read,Grep,Glob,Bash"
   --allowedTools
   "Read"
@@ -172,9 +181,28 @@ fi
 BASE_REF="$(gh pr view "$PR" --json baseRefName -q .baseRefName)"
 HEAD_SHA="$(gh pr view "$PR" --json headRefOid -q .headRefOid)"
 TITLE="$(gh pr view "$PR" --json title -q .title)"
+PR_BODY="$(gh pr view "$PR" --json body -q .body)"
 
 echo "Base: ${BASE_REF}" >&2
 echo "Head SHA: ${HEAD_SHA}" >&2
+
+# A description whose first line starts with "Based on" marks a stacked PR, as
+# in "Based on #123 and #124.". The changes of these PRs are not reviewed.
+BASED_ON_PRS=()
+pr_body_first_line="$(printf '%s\n' "$PR_BODY" | tr -d '\r' |
+  sed -n '/[^[:space:]]/{s/^[[:space:]]*//;p;q;}')"
+if [[ "$pr_body_first_line" == "Based on"* ]]; then
+  while read -r based_on_pr; do
+    BASED_ON_PRS+=("$based_on_pr")
+  done < <(grep -oE '(#|/pull/)[0-9]+' <<< "$pr_body_first_line" |
+    grep -oE '[0-9]+')
+fi
+
+if [[ "${#BASED_ON_PRS[@]}" -gt 0 ]]; then
+  BASED_ON_TEXT="$(printf '#%s, ' "${BASED_ON_PRS[@]}")"
+  BASED_ON_TEXT="${BASED_ON_TEXT%, }"
+  echo "Based on: ${BASED_ON_TEXT}" >&2
+fi
 
 # Temporary Workspace
 
@@ -185,7 +213,33 @@ WORKTREE="$TMPDIR/worktree"
 REAL_CODEX_HOME="${CODEX_HOME:-${HOME}/.codex}"
 ISOLATED_CODEX_HOME="$TMPDIR/codex-home"
 
+# Print token usage of every Claude session from its JSON result envelope.
+print_claude_usage() {
+  local result_file
+
+  for result_file in "$TMPDIR"/*.claude.json "$PASS_OUTPUT_DIR"/*.claude.json; do
+    [[ -s "$result_file" ]] || continue
+    jq -r --arg name "$(basename "$result_file" .claude.json)" '
+      "\($name): \(.num_turns) turns, \(.duration_ms / 1000 | floor) s, "
+      + "$\(.total_cost_usd * 100 | round / 100) list price",
+      (.modelUsage // {} | to_entries[] |
+        "  \(.key): input \(.value.inputTokens), "
+        + "output \(.value.outputTokens), "
+        + "cache read \(.value.cacheReadInputTokens), "
+        + "cache write \(.value.cacheCreationInputTokens)")
+    ' "$result_file" 2>/dev/null || true
+  done
+}
+
 cleanup() {
+  if [[ "$REVIEW_AGENT" == "claude" ]]; then
+    {
+      echo
+      echo "## Claude Usage"
+      echo
+      print_claude_usage
+    } >&2
+  fi
   if [[ -d "$WORKTREE/.git" ]] || [[ -f "$WORKTREE/.git" ]]; then
     git worktree remove --force "$WORKTREE" >/dev/null 2>&1 || true
   fi
@@ -199,7 +253,7 @@ PASS_PROMPT_DIR="$TMPDIR/pass-prompts"
 PASS_OUTPUT_DIR="$TMPDIR/pass-outputs"
 PASS_STATUS_DIR="$TMPDIR/pass-statuses"
 SYNTHESIS_PROMPT_FILE="$TMPDIR/synthesis-prompt.md"
-JSON_FILE="$TMPDIR/review.json"
+JSON_FILE="$TMPDIR/synthesis.json"
 REVIEW_BODY_FILE="$TMPDIR/review-body.md"
 REVIEW_PAYLOAD_FILE="$TMPDIR/review-payload.json"
 
@@ -248,10 +302,49 @@ fi
 
 git worktree add --detach "$WORKTREE" "$FETCHED_HEAD_SHA"
 
-BASE_SHA="$(git -C "$WORKTREE" merge-base "origin/${BASE_REF}" HEAD)"
+# Determine the commit to diff against. This is the merge base with the base
+# branch, or, for stacked PRs, the latest commit already contained in the base
+# branch or one of the PRs this PR is based on.
+review_bases=("$(git merge-base "origin/${BASE_REF}" "$FETCHED_HEAD_SHA")")
+for based_on_pr in ${BASED_ON_PRS[@]+"${BASED_ON_PRS[@]}"}; do
+  git fetch origin "+refs/pull/${based_on_pr}/head" --quiet
+  review_bases+=("$(git merge-base FETCH_HEAD "$FETCHED_HEAD_SHA")")
+done
+
+# Drop every candidate that is already contained in another one.
+independent_bases=()
+while read -r commit; do
+  independent_bases+=("$commit")
+done < <(git merge-base --independent "${review_bases[@]}")
+
+# If the PR is based on several independent PRs, diff against a merge of all of
+# them. The merge commit is not referenced by any ref, so git collects it later.
+REVIEW_BASE_SHA="${independent_bases[0]}"
+for commit in "${independent_bases[@]:1}"; do
+  merged_tree="$(git merge-tree --write-tree "$REVIEW_BASE_SHA" "$commit" |
+    head -n 1)" || {
+    echo "The PRs ${BASED_ON_TEXT} cannot be merged without conflicts." >&2
+    echo "Cannot determine which changes are new in PR #${PR}." >&2
+    exit 1
+  }
+  REVIEW_BASE_SHA="$(git commit-tree "$merged_tree" \
+    -p "$REVIEW_BASE_SHA" -p "$commit" -m "Review base")"
+done
+
+echo "Review base: ${REVIEW_BASE_SHA}" >&2
+
+STACKED_PR_NOTE=""
+if [[ "${#BASED_ON_PRS[@]}" -gt 0 ]]; then
+  STACKED_PR_NOTE="
+This PR is based on ${BASED_ON_TEXT}. The changes of these PRs are excluded from
+the diff above and are reviewed separately. Review only the changes in this
+diff. You may read the code of these PRs for context, but do not report
+findings about it.
+"
+fi
 
 # Print a compact diff size summary before launching the review passes.
-git -C "$WORKTREE" diff --no-ext-diff --numstat "$BASE_SHA"...HEAD |
+git -C "$WORKTREE" diff --no-ext-diff --numstat "$REVIEW_BASE_SHA" HEAD |
   awk '
     {
       files += 1
@@ -271,33 +364,52 @@ git -C "$WORKTREE" diff --no-ext-diff --numstat "$BASE_SHA"...HEAD |
 
 # Review Pass Helpers
 
-# Write one prompt per review pass. Custom repository instructions are appended
-# to every prompt so each pass applies the same project-specific expectations.
-write_pass_prompt() {
+# Write the review prompt. A single session covers all review categories, so
+# the diff and the surrounding code are only read once. Custom repository
+# instructions are appended to apply project-specific expectations.
+write_review_prompt() {
   local prompt_file="$1"
-  local pass_number="$2"
-  local pass_title="$3"
-  local pass_template
-
-  pass_template="$(cat)"
 
   cat > "$prompt_file" <<PROMPT
 Review this PR against origin/${BASE_REF}.
 
-Use git diff origin/${BASE_REF}...HEAD.
+Use git diff ${REVIEW_BASE_SHA} HEAD.
+${STACKED_PR_NOTE}
+Review the entire diff in all four categories below. Read the diff and the code
+it touches once and cover all categories from there, instead of exploring the
+code separately for each category.
+Report concrete, actionable findings. Do not stop at the first finding. Report
+each finding only once, in the category it fits best.
 
-This is pass ${pass_number} of 4: ${pass_title}.
-Only perform this pass. Do not cover other review categories except where they
-directly affect this pass.
-Report concrete, actionable findings. If there are no findings for this pass,
-say so clearly.
-Do not stop at the first finding. Review the entire diff and report all findings
-in this pass.
+1. Correctness and regressions: Review changed production behavior for bugs,
+   edge cases, invalid assumptions, error handling, compatibility, security,
+   race conditions, data loss, performance, and appropriate data type handling.
+2. Tests: Review changed tests and missing tests. Assess whether the tests
+   would actually catch regressions. Look for weak assertions, missing
+   edge/negative cases, brittle tests, over-mocking, implementation-detail
+   testing, and changed behavior without test coverage.
+3. Maintainability and code quality: Review readability, naming, complexity,
+   duplication, abstractions, coupling, style, project conventions, and
+   consistency with surrounding code.
+4. Documentation, comments, and text quality: Review docs, comments, examples,
+   names, error messages, logs, and user/developer-facing text as human-facing
+   writing. Look for wording, clarity, coherence, formatting, structure, reader
+   flow, completeness, terminology consistency, misleading implications, stale
+   explanations, awkward phrasing, and general quality.
 
-${pass_template}
+Output Markdown with the following sections, in this order:
 
-Output Markdown. Order your findings by severity. Include exact file
-and line references.
+## Summary
+Summarize the *intended* PR changes, not the review findings. Keep the summary
+factual and concise with bullets and do not mention any of your findings.
+
+## Correctness and regressions
+## Tests
+## Maintainability and code quality
+## Documentation, comments, and text quality
+
+In each category section, order the findings by severity and include exact file
+and line references. If a category has no findings, say so clearly.
 PROMPT
 
   if [[ -n "$CUSTOM_INSTRUCTIONS" ]]; then
@@ -328,19 +440,31 @@ run_agent_review() {
           -c "model_reasoning_effort=\"${REVIEW_EFFORT}\"" \
           --title "${TITLE} (${label})" \
           "$@" \
-          -
+          - \
+          < "$prompt_file" \
+          > "$output_file" \
+          2> "$stderr_file"
         ;;
       claude)
-        claude "${CLAUDE_ARGS[@]}" "$@"
+        # Keep Claude's JSON result envelope next to the output for the usage
+        # summary, and extract the schema-validated answer or the plain text.
+        local result_file="${output_file%.*}.claude.json"
+        "$CLAUDE_BIN" "${CLAUDE_ARGS[@]}" "$@" \
+          < "$prompt_file" \
+          > "$result_file" \
+          2> "$stderr_file" &&
+          jq -er '
+            if .is_error then error("Claude returned an error: \(.result)")
+            elif .structured_output then .structured_output
+            else .result
+            end
+          ' "$result_file" > "$output_file"
         ;;
-    esac \
-      < "$prompt_file" \
-      > "$output_file" \
-      2> "$stderr_file"
+    esac
   )
 }
 
-# Render a small in-place status table while the four review passes run in parallel.
+# Render a small in-place status table while the review passes run in parallel.
 render_pass_statuses() {
   local frame="$1"
   local status
@@ -350,10 +474,10 @@ render_pass_statuses() {
   local dots
 
   if [[ "${PASS_STATUS_RENDERED:-0}" -eq 1 ]]; then
-    printf '\033[4A' >&2
+    printf '\033[%dA' "${#PASS_LABELS[@]}" >&2
   fi
 
-  for i in 0 1 2 3; do
+  for i in "${!PASS_LABELS[@]}"; do
     label="${PASS_LABELS[$i]}"
     status_file="${PASS_STATUS_FILES[$i]}"
     if [[ -f "$status_file" ]]; then
@@ -377,7 +501,7 @@ render_pass_statuses() {
 # Wait for all review passes, collect their stderr logs, and fail the whole
 # review if any pass failed.
 wait_for_review_passes() {
-  local remaining=4
+  local remaining="${#PASS_STATUS_FILES[@]}"
   local frame=0
   local status_file
   local rc
@@ -396,11 +520,11 @@ wait_for_review_passes() {
     render_pass_statuses "$frame"
   done
 
-  for i in 0 1 2 3; do
+  for i in "${!PASS_PIDS[@]}"; do
     wait "${PASS_PIDS[$i]}" || true
   done
 
-  for i in 0 1 2 3; do
+  for i in "${!PASS_LABELS[@]}"; do
     {
       echo "## ${PASS_LABELS[$i]}"
       echo
@@ -458,48 +582,7 @@ start_review_pass() {
 
 # Review Passes
 
-# Define the four independent review prompts. The final synthesis pass later
-# deduplicates findings across these category-specific reports.
-write_pass_prompt \
-  "$PASS_PROMPT_DIR/01-correctness.md" \
-  1 \
-  "Correctness and regressions" <<'PROMPT'
-Review changed production behavior for bugs, edge cases, invalid assumptions,
-error handling, compatibility, security, race conditions, data loss,
-performance, and appropriate data type handling.
-
-Add a summary section, which summarizes the *intended* PR changes, not the review findings.
-Keep the summary factual and concise with bullets and do not mention any of your findings.
-PROMPT
-
-write_pass_prompt \
-  "$PASS_PROMPT_DIR/02-tests.md" \
-  2 \
-  "Tests" <<'PROMPT'
-Review changed tests and missing tests. Assess whether the tests would actually
-catch regressions. Look for weak assertions, missing edge/negative cases,
-brittle tests, over-mocking, implementation-detail testing, and changed behavior
-without test coverage.
-PROMPT
-
-write_pass_prompt \
-  "$PASS_PROMPT_DIR/03-maintainability.md" \
-  3 \
-  "Maintainability and code quality" <<'PROMPT'
-Review readability, naming, complexity, duplication, abstractions, coupling,
-style, project conventions, and consistency with surrounding code.
-PROMPT
-
-write_pass_prompt \
-  "$PASS_PROMPT_DIR/04-docs.md" \
-  4 \
-  "Documentation, comments, and text quality" <<'PROMPT'
-Review docs, comments, examples, names, error messages, logs, and
-user/developer-facing text as human-facing writing. Look for wording, clarity,
-coherence, formatting, structure, reader flow, completeness, terminology
-consistency, misleading implications, stale explanations, awkward phrasing, and
-general quality.
-PROMPT
+write_review_prompt "$PASS_PROMPT_DIR/01-review.md"
 
 PASS_LABELS=()
 PASS_LOG_FILES=()
@@ -508,49 +591,34 @@ PASS_STATUS_FILES=()
 PASS_STATUS_RENDERED=0
 
 start_review_pass \
-  "01-correctness" \
-  "Pass 1: Correctness and regressions" \
-  "$PASS_PROMPT_DIR/01-correctness.md" \
-  "$PASS_OUTPUT_DIR/01-correctness.md"
-start_review_pass \
-  "02-tests" \
-  "Pass 2: Tests" \
-  "$PASS_PROMPT_DIR/02-tests.md" \
-  "$PASS_OUTPUT_DIR/02-tests.md"
-start_review_pass \
-  "03-maintainability" \
-  "Pass 3: Maintainability and code quality" \
-  "$PASS_PROMPT_DIR/03-maintainability.md" \
-  "$PASS_OUTPUT_DIR/03-maintainability.md"
-start_review_pass \
-  "04-docs" \
-  "Pass 4: Documentation, comments, and text quality" \
-  "$PASS_PROMPT_DIR/04-docs.md" \
-  "$PASS_OUTPUT_DIR/04-docs.md"
+  "01-review" \
+  "Review" \
+  "$PASS_PROMPT_DIR/01-review.md" \
+  "$PASS_OUTPUT_DIR/01-review.md"
 
 wait_for_review_passes
 
 # Final Synthesis
 
-# Ask the agent to merge the four Markdown reports into the GitHub code scanning
+# Ask the agent to convert the Markdown report into the GitHub code scanning
 # diagnostic shape. Keeping this as JSON makes validation and payload rendering
 # deterministic.
 {
   cat <<PROMPT
-Merge the four review pass reports for PR #${PR} in ${OWNER}/${REPO}.
+Convert the review report for PR #${PR} in ${OWNER}/${REPO} into JSON.
 
 Return ONLY valid JSON.
 
-Use the pass reports below as the source material. Deduplicate overlapping
+Use the review report below as the source material. Deduplicate overlapping
 findings, resolve contradictions conservatively, and keep only findings that
 are concrete and actionable.
 Order final findings by severity. Preserve file and line references.
-Do not invent new findings that are not supported by the pass reports.
+Do not invent new findings that are not supported by the review report.
 
 Hard requirements:
 - Return a single JSON object.
 - Top-level keys must be "body" and "diagnostics".
-- "body" must contain the summary of the PR changes, as returned by Pass 1, not the review findings.
+- "body" must contain the summary of the PR changes from the "Summary" section of the report, not the review findings.
 - "diagnostics" must be an array.
 - Each diagnostic must be actionable and tied to a changed line in the diff.
 - Use severity "HIGH" for likely bugs/security/data-loss issues, "MEDIUM"
@@ -590,31 +658,10 @@ PROMPT
   fi
 
   cat <<'PROMPT'
-## Pass 1: Correctness and regressions
+# Review Report
 
 PROMPT
-  cat "$PASS_OUTPUT_DIR/01-correctness.md"
-
-  cat <<'PROMPT'
-
-## Pass 2: Tests
-
-PROMPT
-  cat "$PASS_OUTPUT_DIR/02-tests.md"
-
-  cat <<'PROMPT'
-
-## Pass 3: Maintainability and code quality
-
-PROMPT
-  cat "$PASS_OUTPUT_DIR/03-maintainability.md"
-
-  cat <<'PROMPT'
-
-## Pass 4: Documentation, comments, and text quality
-
-PROMPT
-  cat "$PASS_OUTPUT_DIR/04-docs.md"
+  cat "$PASS_OUTPUT_DIR/01-review.md"
 } > "$SYNTHESIS_PROMPT_FILE"
 
 echo "Running ${AGENT_NAME} review pass: Final synthesis" >&2
@@ -627,21 +674,12 @@ case "$REVIEW_AGENT" in
       >(tee -a "$AGENT_LOG_FILE" >&2)
     ;;
   claude)
-    # Claude wraps the schema-validated answer in a JSON result envelope.
     run_agent_review \
       "Final synthesis" \
       "$SYNTHESIS_PROMPT_FILE" \
-      "$TMPDIR/claude-synthesis-result.json" \
+      "$JSON_FILE" \
       >(tee -a "$AGENT_LOG_FILE" >&2) \
-      --output-format json \
       --json-schema "$CLAUDE_SYNTHESIS_SCHEMA"
-    jq -e '.structured_output // empty' \
-      "$TMPDIR/claude-synthesis-result.json" \
-      > "$JSON_FILE" || {
-      echo "Claude returned no structured synthesis output:" >&2
-      cat "$TMPDIR/claude-synthesis-result.json" >&2
-      exit 1
-    }
     ;;
 esac
 
@@ -777,3 +815,5 @@ env GITHUB_TOKEN="$TOKEN" \
   "repos/${OWNER}/${REPO}/pulls/${PR}/reviews" \
   --input "$REVIEW_PAYLOAD_FILE" \
   >/dev/null
+
+print_findings

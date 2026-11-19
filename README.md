@@ -5,7 +5,13 @@ By default, it uses Claude Code with the included quota of a Claude subscription
 Alternatively, it can use Codex CLI with the included quota of a ChatGPT subscription instead of OpenAI API billing (see [Choosing the Review Agent](#choosing-the-review-agent)).
 It uses GitHub CLI to post reviews.
 
-The script checks out the pull request head in a temporary detached worktree, runs several focused review passes against the pull request base branch, asks the agent to merge the findings of the individual passes, and posts any diagnostics as inline review comments.
+The script checks out the pull request head in a temporary detached worktree, runs one review session against the pull request base branch that covers correctness, tests, maintainability, and documentation, asks the agent to convert the findings into structured diagnostics, and posts them as inline review comments.
+
+## Stacked Pull Requests
+
+If the first line of the pull request description starts with `Based on` and lists pull requests, for example `Based on #123 and #124.`, the changes of these pull requests are not reviewed.
+The script then diffs against the latest commit contained in the base branch or in one of the listed pull requests, so only the new changes on top of them are reviewed.
+If the listed pull requests are independent of each other, the script diffs against a temporary merge of all of them and stops with an error if they conflict.
 
 ## Requirements
 
@@ -87,13 +93,15 @@ export REVIEW_AGENT=codex
 
 Further optional environment variables:
 
-- `REVIEW_EFFORT` sets the reasoning effort of all passes (default: `medium`).
+- `REVIEW_EFFORT` sets the reasoning effort of the review and the synthesis (default: `high`).
   Codex accepts `minimal`, `low`, `medium`, `high`, and `xhigh`; Claude Code accepts `low`, `medium`, `high`, `xhigh`, and `max`.
   The previous variable `CODEX_REVIEW_REASONING_EFFORT` is still honored when `REVIEW_EFFORT` is unset.
 - `CLAUDE_REVIEW_MODEL` selects the Claude model, for example `opus` or `sonnet`.
   Without it, Claude Code uses its default model.
+- `CLAUDE_BIN` selects the Claude Code binary (default: `claude`), for example to compare versions.
 
 The top-level review heading and terminal output name the selected agent.
+With Claude Code, the terminal output ends with the number of turns, the duration, the cost at API list prices, and the token usage of each session.
 
 ## Custom Review Instructions
 
@@ -110,7 +118,7 @@ For example, reviews for `efaulhaber/codex-pr-review` load:
 <script-dir>/custom-instructions/efaulhaber/codex-pr-review.md
 ```
 
-When a matching file exists, its contents are included in each review pass and in the final synthesis prompt.
+When a matching file exists, its contents are included in the review prompt and in the final synthesis prompt.
 The terminal output reports whether custom instructions were loaded or no matching file was found.
 
 ## What Gets Posted
@@ -132,9 +140,9 @@ The posted review is created with GitHub's `COMMENT` event, so it does not appro
 ## Security
 
 - The script runs the agent with isolated settings to ignore local custom instructions.
-- Codex passes run with `--ephemeral --ignore-user-config --ignore-rules --sandbox read-only` against a temporary detached worktree and temporary auth-only `CODEX_HOME`.
+- The Codex review runs with `--ephemeral --ignore-user-config --ignore-rules --sandbox read-only` against a temporary detached worktree and temporary auth-only `CODEX_HOME`.
 - The final synthesis pass uses the same isolation flags.
-- Claude Code passes run with `--print --safe-mode --strict-mcp-config --no-session-persistence --permission-mode dontAsk`, so `CLAUDE.md` files, skills, hooks, plugins, and MCP servers are not loaded and no session is saved.
+- The Claude Code review runs with `--print --safe-mode --strict-mcp-config --no-session-persistence --permission-mode dontAsk`, so `CLAUDE.md` files, skills, hooks, plugins, and MCP servers are not loaded and no session is saved.
   Only the `Read`, `Grep`, and `Glob` tools and read-only `git` commands (`diff`, `log`, `show`, `blame`, `grep`, `ls-files`, `merge-base`, `rev-parse`, `status`) are allowed; any other tool call is denied automatically.
 - The Claude Code synthesis pass returns its JSON through `--json-schema` structured output.
 - The temporary worktree and intermediate files are removed when the script exits.
